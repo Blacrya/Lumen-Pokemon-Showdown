@@ -269,11 +269,16 @@ exports.grouplist = [
 		id: "player",
 		name: "Player",
 		inherit: '+',
+		jurisdiction: 'u',
 		roomvoice: true,
 		modchat: true,
 		roomonly: true,
 		privateroom: true,
-		joinbattle: true
+		joinbattle: true,
+		kick: true,
+		roomban: true,
+		warm: true,
+		mute: true
 	},
 	{
 		symbol: '@',
