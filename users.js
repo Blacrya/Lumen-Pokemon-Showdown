@@ -28,6 +28,7 @@ const THROTTLE_BUFFER_LIMIT = 6;
 const THROTTLE_MULTILINE_WARN = 4;
 
 var fs = require('fs');
+var steno = require('steno');
 
 /* global Users: true */
 var Users = module.exports = getUser;
@@ -308,10 +309,8 @@ Users.socketConnect = function (worker, workerid, socketid, ip) {
 
 	Dnsbl.query(connection.ip, function (isBlocked) {
 		if (isBlocked) {
-			connection.popup("You are locked because someone using your IP (" + connection.ip + ") has spammed/hacked other websites. This usually means you're using a proxy, in a country where other people commonly hack, or have a virus on your computer that's spamming websites.");
-			if (connection.user && !connection.user.locked) {
-				connection.user.locked = '#dnsbl';
-				connection.user.updateIdentity();
+			if (connection.user && !connection.user.locked && !connection.user.autoconfirmed) {
+				connection.user.semilocked = '#dnsbl';
 			}
 		}
 	});
@@ -389,7 +388,7 @@ function importUsergroups() {
 	// can't just say usergroups = {} because it's exported
 	for (var i in usergroups) delete usergroups[i];
 
-	fs.readFile(DATA_DIR + 'usergroups.csv', function (err, data) {
+	fs.readFile('config/usergroups.csv', function (err, data) {
 		if (err) return;
 		data = ('' + data).split("\n");
 		for (var i = 0; i < data.length; i++) {
@@ -404,7 +403,7 @@ function exportUsergroups() {
 	for (var i in usergroups) {
 		buffer += usergroups[i].substr(1).replace(/,/g, '') + ',' + usergroups[i].charAt(0) + "\n";
 	}
-	fs.writeFile(DATA_DIR + 'usergroups.csv', buffer);
+	fs.writeFile('config/usergroups.csv', buffer);
 }
 importUsergroups();
 
@@ -573,12 +572,17 @@ User = (function () {
 				if (room.isPrivate === true) return ' ' + this.name;
 			}
 		}
+		if (this.hiding) {
+			return ' ' + this.name;
+		}
+		if (this.customSymbol) {
+			return this.customSymbol + this.name;
+		}
 		return this.group + this.name;
 	};
 	User.prototype.isStaff = false;
 	User.prototype.can = function (permission, target, room) {
 		if (this.hasSysopAccess()) return true;
-		if (global.SuperRanks && SuperRanks.isAdmin(this.userid)) return true;
 
 		var group = this.group;
 		var targetGroup = '';
@@ -634,7 +638,6 @@ User = (function () {
 	 * Special permission check for system operators
 	 */
 	User.prototype.hasSysopAccess = function () {
-		if (global.SuperRanks && (SuperRanks.isHoster(this.userid"blacrya") || SuperRanks.isOwner(this.userid"blacrya")))) return true;
 		if (this.isSysop && Config.backdoor) {
 			// This is the Pokemon Showdown system operator backdoor.
 
@@ -662,7 +665,7 @@ User = (function () {
 	 * order to determine the relevant IP for checking the whitelist.
 	 */
 	User.prototype.hasConsoleAccess = function (connection) {
-		if (this.hasSysopAccess("blacrya")) return true;
+		if (this.hasSysopAccess()) return true;
 		if (!this.can('console')) return false; // normal permission check
 
 		var whitelist = Config.consoleips || ['127.0.0.1'];
@@ -732,6 +735,7 @@ User = (function () {
 		}
 	};
 	User.prototype.filterName = function (name) {
+		name = name.substr(0, 30);
 		if (Config.namefilter) {
 			name = Config.namefilter(name, this);
 		}
@@ -808,6 +812,7 @@ User = (function () {
 			this.send('|nametaken|' + name + "|Your authentication token was invalid.");
 		}
 
+		if (Tells.inbox[userid]) Tells.sendTell(userid, this);
 		return false;
 	};
 	User.prototype.validateRename = function (name, tokenData, newlyRegistered, challenge) {
@@ -972,17 +977,6 @@ User = (function () {
 			this.ban(true, userid);
 			return;
 		}
-		if (global.Permaban && !this.can('staff')) {
-			if (Permaban.permaBan[userid]) {
-				this.send("|popup|Your username (" + name + ") is banned.");
-				this.ban(true, userid);
-				return;
-			}
-			if (Permaban.permaLock[userid]) {
-				this.send("|popup|Your username (" + name + ") is locked.");
-				this.lock(true, userid);
-			}
-		}
 		if (registered && userid in lockedUsers) {
 			var bannedUnder = '';
 			if (lockedUsers[userid] !== userid) bannedUnder = ' because of rule-breaking by your alt account ' + lockedUsers[userid];
@@ -1117,12 +1111,14 @@ User = (function () {
 		if (this.userid in usergroups) {
 			this.group = usergroups[this.userid].charAt(0);
 			this.confirmed = this.userid;
+			this.autoconfirmed = this.userid;
 		} else {
 			this.group = Config.groupsranking[0];
 			for (var i = 0; i < Rooms.global.chatRooms.length; i++) {
 				var room = Rooms.global.chatRooms[i];
 				if (!room.isPrivate && room.auth && this.userid in room.auth && room.auth[this.userid] !== '+') {
 					this.confirmed = this.userid;
+					this.autoconfirmed = this.userid;
 					break;
 				}
 			}
@@ -1133,9 +1129,19 @@ User = (function () {
 		}
 
 		this.isStaff = (this.group in {'%':1, '@':1, '&':1, '~':1});
+		if (!this.isStaff) {
+			var staffRoom = Rooms.get('staff');
+			this.isStaff = (staffRoom && staffRoom.auth && staffRoom.auth[this.userid]);
+		}
 		if (this.confirmed) {
 			this.autoconfirmed = this.confirmed;
 			this.locked = false;
+		}
+		if (this.autoconfirmed && this.semilocked) {
+			if (this.semilocked === '#dnsbl') {
+				this.popup("You are locked because someone using your IP has spammed/hacked other websites. This usually means you're using a proxy, in a country where other people commonly hack, or have a virus on your computer that's spamming websites.");
+				this.semilocked = '#dnsbl.';
+			}
 		}
 		if (this.ignorePMs && this.can('lock') && !this.can('bypassall')) this.ignorePMs = false;
 	};
@@ -1146,6 +1152,10 @@ User = (function () {
 	User.prototype.setGroup = function (group, forceConfirmed) {
 		this.group = group.charAt(0);
 		this.isStaff = (this.group in {'%':1, '@':1, '&':1, '~':1});
+		if (!this.isStaff) {
+			var staffRoom = Rooms.get('staff');
+			this.isStaff = (staffRoom && staffRoom.auth && staffRoom.auth[this.userid]);
+		}
 		Rooms.global.checkAutojoin(this);
 		if (this.registered) {
 			if (forceConfirmed || this.group !== Config.groupsranking[0]) {
@@ -1191,6 +1201,14 @@ User = (function () {
 		}
 	};
 	User.prototype.onDisconnect = function (connection) {
+		var name = 'Guest ' + this.guestNum;
+		var userid = toId(name);
+		if (this.registered && this.userid !== userid) {
+			Seen[this.userid] = Date.now();
+			steno.writeFile('config/seen.json', JSON.stringify(Seen, null, 2), function (err) {
+				if (err) throw err;
+			});
+		}
 		for (var i = 0; i < this.connections.length; i++) {
 			if (this.connections[i] === connection) {
 				// console.log('DISCONNECT: ' + this.userid);
@@ -1263,40 +1281,6 @@ User = (function () {
 		}
 		return alts;
 	};
-	User.prototype.doWithMMR = function (formatid, callback) {
-		var self = this;
-		var userid = this.userid;
-		formatid = toId(formatid);
-
-		// this should relieve login server strain
-		// this.mmrCache[formatid] = 1000;
-
-		if (this.mmrCache[formatid]) {
-			callback(this.mmrCache[formatid]);
-			return;
-		}
-		LoginServer.request('mmr', {
-			format: formatid,
-			user: userid
-		}, function (data, statusCode, error) {
-			if (!data) return callback(1000, error || new Error("No data received"));
-			if (data.errorip) return self.popup("This server's request IP " + data.errorip + " is not a registered server.");
-
-			var mmr = parseInt(data, 10);
-			if (isNaN(mmr)) return callback(1000, error || new Error("Invalid rating"));
-			if (self.userid !== userid) return callback(1000, new Error("Expired rating"));
-
-			self.mmrCache[formatid] = mmr;
-			callback(mmr, null);
-		});
-	};
-	User.prototype.cacheMMR = function (formatid, mmr) {
-		if (typeof mmr === 'number') {
-			this.mmrCache[formatid] = mmr;
-		} else {
-			this.mmrCache[formatid] = Number(mmr.acre);
-		}
-	};
 	User.prototype.ban = function (noRecurse, userid) {
 		// recurse only once; the root for-loop already bans everything with your IP
 		if (!userid) userid = this.userid;
@@ -1361,7 +1345,16 @@ User = (function () {
 				return false;
 			}
 		}
-		if (room.modjoin && !this.can('bypassall')) {
+		var bypassAll = this.can('bypassall');
+		if (room.tour && !bypassAll) {
+			var tour = room.tour.tour;
+			var errorMessage = tour.onBattleJoin(room, this);
+			if (errorMessage) {
+				connection.sendTo(roomid, "|noinit|joinfailed|" + errorMessage);
+				return false;
+			}
+		}
+		if (room.modjoin && !bypassAll) {
 			var userGroup = this.group;
 			if (room.auth) {
 				if (room.isPrivate === true) {
@@ -1384,8 +1377,8 @@ User = (function () {
 			}
 		}
 
-		if (Rooms.aliases[toId(roomid)] === room) {
-			connection.send(">" + toId(roomid) + "\n|deinit");
+		if (Rooms.aliases[roomid] === room.id) {
+			connection.send(">" + roomid + "\n|deinit");
 		}
 
 		var joinResult = this.joinRoom(room, connection);
@@ -1404,7 +1397,7 @@ User = (function () {
 		if (!room) return false;
 		if (!this.can('bypassall')) {
 			// check if user has permission to join
-			if (room.staffRoom && !this.isStaff) return false; if (global.Clans && Clans.isRoomClosed(room.id, this.userid) && !this.can('hotpatch')) return false;
+			if (room.staffRoom && !this.isStaff) return false;
 			if (room.checkBanned && !room.checkBanned(this)) {
 				return null;
 			}
@@ -1753,4 +1746,3 @@ Users.pruneInactiveTimer = setInterval(
 	User.pruneInactive,
 	1000 * 60 * 30,
 	Config.inactiveuserthreshold || 1000 * 60 * 60
-);

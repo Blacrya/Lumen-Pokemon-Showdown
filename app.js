@@ -36,6 +36,9 @@
  *
  *   Used to abstract out network connections. sockets.js handles
  *   the actual server and connection set-up.
+ * Tells - from tells.js
+ *
+ *   Handles offline messaging.
  *
  * @license MIT license
  */
@@ -46,11 +49,6 @@
 
 // Make sure our dependencies are available, and install them if they
 // aren't
-
-/* ----------------Data-Directory------------*/
-global.DATA_DIR = (process.env.OPENSHIFT_DATA_DIR) ? process.env.OPENSHIFT_DATA_DIR : './config/';
-global.LOGS_DIR = (process.env.OPENSHIFT_DATA_DIR) ? (process.env.OPENSHIFT_DATA_DIR + 'logs/') : './logs/';
-/* ------------------------------------------*/
 
 function runNpm(command) {
 	if (require.main !== module) throw new Error("Dependencies unmet");
@@ -79,27 +77,18 @@ if (isLegacyEngine && !(''.includes)) {
  * Load configuration
  *********************************************************/
 
+try {
+	global.Config = require('./config/config.js');
+} catch (err) {
+	if (err.code !== 'MODULE_NOT_FOUND') throw err;
 
-// Synchronously, since it's needed before we can start the server
-if (!fs.existsSync('./config/config.js')) {
+	// Copy it over synchronously from config-example.js since it's needed before we can start the server
 	console.log("config.js doesn't exist - creating one with default settings...");
-	fs.writeFileSync('config/config.js',
-		fs.readFileSync('config/config-example.js')
+	fs.writeFileSync(path.resolve(__dirname, 'config/config.js'),
+		fs.readFileSync(path.resolve(__dirname, 'config/config-example.js'))
 	);
+	global.Config = require('./config/config.js');
 }
-
-if (!fs.existsSync(DATA_DIR + "avatars/")) {
-	fs.mkdirSync(DATA_DIR + "avatars/");
-}
-
-if (!fs.existsSync(LOGS_DIR)) {
-	fs.mkdirSync(LOGS_DIR);
-	fs.mkdirSync(LOGS_DIR + 'chat/');
-	fs.mkdirSync(LOGS_DIR + 'modlog/');
-	fs.mkdirSync(LOGS_DIR + 'repl/');
-}
-
-global.Config = require('./config/config.js');
 
 if (Config.watchconfig) {
 	fs.watchFile(path.resolve(__dirname, 'config/config.js'), function (curr, prev) {
@@ -145,7 +134,13 @@ global.ResourceMonitor = {
 	log: function (text) {
 		console.log(text);
 		if (Rooms.get('staff')) {
-			Rooms.get('staff').add('||' + text).update();
+			Rooms.get('staff').add('|c|~|' + text).update();
+		}
+	},
+	adminlog: function (text) {
+		console.log(text);
+		if (Rooms.get('upperstaff')) {
+			Rooms.get('upperstaff').add('|c|~|' + text).update();
 		}
 	},
 	logHTML: function (text) {
@@ -160,18 +155,14 @@ global.ResourceMonitor = {
 		name = (name ? ': ' + name : '');
 		if (ip in this.connections && duration < 30 * 60 * 1000) {
 			this.connections[ip]++;
-			if (this.connections[ip] < 500 && duration < 5 * 60 * 1000 && this.connections[ip] % 60 === 0) {
-				this.log('[ResourceMonitor] IP ' + ip + ' has connected ' + this.connections[ip] + ' times in the last ' + duration.duration() + name);
-			} else if (this.connections[ip] < 500 && this.connections[ip] % 120 === 0) {
-				this.log('[ResourceMonitor] IP ' + ip + ' has connected ' + this.connections[ip] + ' times in the last ' + duration.duration() + name);
-			} else if (this.connections[ip] === 500) {
-				this.log('[ResourceMonitor] IP ' + ip + ' has been banned for connection flooding (' + this.connections[ip] + ' times in the last ' + duration.duration() + name + ')');
+			if (this.connections[ip] === 500) {
+				this.adminlog('[ResourceMonitor] IP ' + ip + ' has been banned for connection flooding (' + this.connections[ip] + ' times in the last ' + duration.duration() + name + ')');
 				return true;
 			} else if (this.connections[ip] > 500) {
 				if (this.connections[ip] % 500 === 0) {
 					var c = this.connections[ip] / 500;
 					if (c < 5 || c % 2 === 0 && c < 10 || c % 5 === 0) {
-						this.log('[ResourceMonitor] Banned IP ' + ip + ' has connected ' + this.connections[ip] + ' times in the last ' + duration.duration() + name);
+						this.adminlog('[ResourceMonitor] Banned IP ' + ip + ' has connected ' + this.connections[ip] + ' times in the last ' + duration.duration() + name);
 					}
 				}
 				return true;
@@ -321,11 +312,29 @@ global.toId = function (text) {
 	return ('' + text).toLowerCase().replace(/[^a-z0-9]+/g, '');
 };
 
+global.Tools = require('./tools.js').includeFormats();
+
 global.LoginServer = require('./loginserver.js');
+
+global.Ladders = require('./ladders-remote.js');
 
 global.Users = require('./users.js');
 
 global.Rooms = require('./rooms.js');
+
+Rooms.global.formatListText = Rooms.global.getFormatListText();
+
+global.Tells = require('./tells.js');
+
+global.Database = require('./database.js')(Config.database);
+
+try {
+	global.Seen = JSON.parse(fs.readFileSync('config/seen.json', 'utf8'));
+} catch (e) {
+	if (e instanceof SyntaxError) e.message = 'Malformed JSON in seen.json: \n' + e.message;
+	if (e.code !== 'ENOENT') throw e;
+	global.Seen = {};
+}
 
 delete process.send; // in case we're a child process
 global.Verifier = require('./verifier.js');
@@ -349,7 +358,7 @@ if (Config.crashguard) {
 	var lastCrash = 0;
 	process.on('uncaughtException', function (err) {
 		var dateNow = Date.now();
-		var quietCrash = require('./crashlogger.js')(err, 'The main process');
+		var quietCrash = require('./crashlogger.js')(err, 'The main process', true);
 		quietCrash = quietCrash || ((dateNow - lastCrash) <= 1000 * 60 * 5);
 		lastCrash = Date.now();
 		if (quietCrash) return;
@@ -358,7 +367,6 @@ if (Config.crashguard) {
 			Rooms.lobby.addRaw('<div class="broadcast-red"><b>THE SERVER HAS CRASHED:</b> ' + stack + '<br />Please restart the server.</div>');
 			Rooms.lobby.addRaw('<div class="broadcast-red">You will not be able to talk in the lobby or start new battles until the server restarts.</div>');
 		}
-		Config.modchat = 'crash';
 		Rooms.global.lockdown = true;
 	});
 }
@@ -372,15 +380,6 @@ global.Sockets = require('./sockets.js');
 /*********************************************************
  * Set up our last global
  *********************************************************/
-
-// This slow operation is done *after* we start listening for connections
-// to the server. Anybody who connects while this require() is running will
-// have to wait a couple seconds before they are able to join the server, but
-// at least they probably won't receive a connection error message.
-global.Tools = require('./tools.js');
-
-// After loading tools, generate and cache the format list.
-Rooms.global.formatListText = Rooms.global.getFormatListText();
 
 global.TeamValidator = require('./team-validator.js');
 
@@ -405,6 +404,4 @@ fs.readFile(path.resolve(__dirname, 'config/ipbans.txt'), function (err, data) {
  * Start up the REPL server
  *********************************************************/
 
-//require('./repl.js').start('app', function (cmd) { return eval(cmd); });
-global.League = require('./league.js'); global.Shop = require('./shop.js'); global.Bot = require('./bot.js');
-global.Clans = require('./clans.js'); global.War = require('./war.js'); global.tour = new (require('./tour.js').tour)(); global.teamTour = require('./teamtour.js');
+require('./repl.js').start('app', function (cmd) { return eval(cmd); });
